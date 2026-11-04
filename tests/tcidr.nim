@@ -129,3 +129,64 @@ suite "real world usage":
     check(isPrivate("192.168.0.1"))
     check(not isPrivate("172.32.0.1"))
     check(not isPrivate("8.8.8.8"))
+
+suite "subnets":
+  test "split /24 into /26s":
+    let parts = parseCidr("192.168.1.0/24").subnets(26)
+    check(parts.len == 4)
+    check($parts[0] == "192.168.1.0/26")
+    check($parts[1] == "192.168.1.64/26")
+    check($parts[2] == "192.168.1.128/26")
+    check($parts[3] == "192.168.1.192/26")
+
+  test "block count is 2^(delta)":
+    check(parseCidr("10.0.0.0/16").subnets(24).len == 256)
+    check(parseCidr("10.0.0.0/16").subnets(20).len == 16)
+
+  test "first and last subnet boundaries":
+    let parts = parseCidr("10.1.0.0/16").subnets(20)
+    check($parts[0] == "10.1.0.0/20")
+    check($parts[^1] == "10.1.240.0/20")
+
+  test "every subnet is contained in the parent and parses to itself":
+    let parent = parseCidr("172.16.0.0/16")
+    for sub in parent.subnets(19):
+      check(parent.contains(sub))
+      check(parseCidr($sub) == sub)
+
+  test "equal prefix yields the single normalized block":
+    let parts = parseCidr("10.1.2.3/24").subnets(24)
+    check(parts.len == 1)
+    check($parts[0] == "10.1.2.0/24")
+
+  test "invalid prefix lengths raise":
+    expect CidrError:
+      discard parseCidr("10.0.0.0/24").subnets(16)
+    expect CidrError:
+      discard parseCidr("10.0.0.0/24").subnets(33)
+    expect CidrError:
+      discard parseCidr("2001:db8::/32").subnets(129)
+
+  test "IPv6 split /124 into /126s":
+    let parts = parseCidr("2001:db8::/124").subnets(126)
+    check(parts.len == 4)
+    check($parts[0] == "2001:db8::/126")
+    check($parts[^1] == "2001:db8::c/126")
+
+  test "iterator is lazy: huge IPv6 range can be abandoned early":
+    # /0 -> /120 is 2^120 blocks; taking two must return immediately.
+    var got: seq[Cidr] = @[]
+    for sub in parseCidr("::/0").iterSubnets(120):
+      got.add(sub)
+      if got.len == 2:
+        break
+    check(got.len == 2)
+    check($got[0] == "::/120")
+    check($got[1] == "::100/120")
+
+  test "eager cap raises and can be raised explicitly":
+    expect CidrError:
+      discard parseCidr("0.0.0.0/0").subnets(24)
+    expect CidrError:
+      discard parseCidr("10.0.0.0/16").subnets(24, maxBlocks = 128)
+    check(parseCidr("10.0.0.0/16").subnets(24, maxBlocks = 300).len == 256)

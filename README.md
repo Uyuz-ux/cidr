@@ -26,6 +26,7 @@ echo toPrefixLen(parseIpAddress("255.255.255.0"))   # 24
 - **Network / last address** (broadcast/top), host-bit normalization
 - **Netmask conversion**: `255.255.255.0` → `/24` (rejects non-contiguous masks)
 - **Block size** (`/24` → 256 addresses), saturating for huge IPv6 blocks
+- **Subnet enumeration**: split a block into subnets (`iterSubnets` is lazy — safe for huge IPv6 ranges; `subnets` is eager with a safety cap)
 - Zero dependencies, pure standard library, `CidrError` (a `ValueError`) on bad input
 
 ## Installation
@@ -37,7 +38,7 @@ nimble install cidr
 or add to your `.nimble`:
 
 ```
-requires "cidr >= 0.1.0"
+requires "cidr >= 0.2.0"
 ```
 
 ## API quick reference
@@ -52,6 +53,30 @@ requires "cidr >= 0.1.0"
 | `c.normalized` | Canonical form with host bits cleared |
 | `c.size: BiggestUInt` | Number of addresses (saturates at 2^64) |
 | `toPrefixLen(netmask: IpAddress): int` | Netmask → prefix length |
+| `c.iterSubnets(newPrefixLen): iterator` | Enumerate subnets, first to last. Lazy — safe for ranges that cannot even be counted in 64 bits; stop early when you have enough |
+| `c.subnets(newPrefixLen, maxBlocks = 4096): seq[Cidr]` | Eager version with a safety cap; raises when the split exceeds it |
+
+## Example: splitting a block into subnets
+
+```nim
+import cidr
+
+for sub in parseCidr("192.168.1.0/24").subnets(26):
+  echo sub
+# 192.168.1.0/26
+# 192.168.1.64/26
+# 192.168.1.128/26
+# 192.168.1.192/26
+
+# Huge IPv6 splits: the lazy iterator returns on demand,
+# no 2^120-counting required.
+var first = 0
+for sub in parseCidr("2001:db8::/32").iterSubnets(36):
+  echo sub
+  inc first
+  if first == 4:
+    break
+```
 
 ## Example: private-network classifier
 
@@ -76,7 +101,7 @@ echo isPrivate(parseIpAddress("8.8.8.8"))      # false
 nimble test
 ```
 
-21 unit tests, CI on Nim 1.6 / 2.0 / stable.
+30 unit tests, CI on Nim 1.6 / 2.0 / 2.2 / stable.
 
 ## License
 

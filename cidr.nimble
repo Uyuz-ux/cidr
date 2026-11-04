@@ -1,4 +1,4 @@
-version       = "0.1.0"
+version       = "0.2.0"
 author        = "Uyuz-ux"
 description   = "IPv4/IPv6 CIDR notation parsing and operations for Nim. Zero dependencies."
 license       = "MIT"

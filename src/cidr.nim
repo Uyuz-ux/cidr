@@ -193,3 +193,83 @@ func prefixLenFromNetmaskStr*(s: string): int {.raises: [CidrError].} =
   except ValueError:
     raise cidrErr("invalid netmask: " & s)
   toPrefixLen(ip)
+
+func setBitVal(ip: var IpAddress, bitIndex: int, value: uint8) {.inline.} =
+  ## Write `value` (0 or 1) into bit `bitIndex` (MSB-first numbering,
+  ## same convention as `bitAt`).
+  let byteIdx = bitIndex div 8
+  let mask = uint8(1'u8 shl (7 - (bitIndex mod 8)))
+  case ip.family
+  of IPv4:
+    if value != 0: ip.address_v4[byteIdx] = ip.address_v4[byteIdx] or mask
+    else: ip.address_v4[byteIdx] = ip.address_v4[byteIdx] and (not mask)
+  of IPv6:
+    if value != 0: ip.address_v6[byteIdx] = ip.address_v6[byteIdx] or mask
+    else: ip.address_v6[byteIdx] = ip.address_v6[byteIdx] and (not mask)
+
+func validateSubnetSplit(c: Cidr, newPrefixLen: int) {.raises: [CidrError].} =
+  ## Shared argument validation for `iterSubnets` and `subnets`.
+  let maxBits = case c.address.family
+    of IPv4: 32
+    of IPv6: 128
+  if newPrefixLen < c.prefixLen:
+    raise cidrErr("new prefix length (" & $newPrefixLen &
+      ") is shorter than the block itself (" & $c.prefixLen & ")")
+  if newPrefixLen > maxBits:
+    raise cidrErr("prefix length out of range for IPv" &
+      (if c.address.family == IPv4: "4" else: "6") & ": " & $newPrefixLen)
+
+iterator iterSubnets*(c: Cidr, newPrefixLen: int): Cidr {.raises: [CidrError].} =
+  ## Enumerates the subnets of `c` at `newPrefixLen`, first to last.
+  ##
+  ## The parent block is normalized first; every yielded subnet is
+  ## contained in it and satisfies `parseCidr($subnet) == subnet`.
+  ##
+  ## The iterator is lazy and walks the subnet number by propagating a
+  ## carry through the address bits, so it is safe for ranges that
+  ## cannot be counted in a 64-bit integer (e.g. an IPv6 /0 split into
+  ## /120s) - stop early with `break` or `toSeq(n)` as needed.
+  ##
+  ## Raises `CidrError` when `newPrefixLen` is shorter than the block's
+  ## own prefix or out of range for the address family.
+  runnableExamples:
+    let block24 = parseCidr("192.168.1.0/24")
+    for sub in block24.iterSubnets(26):
+      echo sub    # 192.168.1.0/26, .64/26, .128/26, .192/26
+
+  c.validateSubnetSplit(newPrefixLen)
+  var cur = c.normalized.address
+  while true:
+    yield Cidr(address: cur, prefixLen: newPrefixLen)
+    # Increment the subnet number: carry from the least significant
+    # subnet bit (newPrefixLen-1) toward the most significant
+    # (c.prefixLen). Wrap-around means every subnet was produced.
+    var bit = newPrefixLen - 1
+    var carried = true
+    while carried and bit >= c.prefixLen:
+      if cur.bitAt(bit) == 0:
+        cur.setBitVal(bit, 1)
+        carried = false
+      else:
+        cur.setBitVal(bit, 0)
+        dec bit
+    if carried:
+      break
+
+func subnets*(c: Cidr, newPrefixLen: int, maxBlocks = 4096): seq[Cidr] {.raises: [CidrError].} =
+  ## Eager version of `iterSubnets`, capped for safety: raises
+  ## `CidrError` when the split produces more than `maxBlocks` subnets
+  ## (default 4096) or when the count does not fit in 64 bits. For
+  ## unbounded ranges use the lazy `iterSubnets` instead.
+  c.validateSubnetSplit(newPrefixLen)
+  let delta = newPrefixLen - c.prefixLen
+  if delta >= 64:
+    raise cidrErr("split produces 2^" & $delta &
+      " subnets, which does not fit a 64-bit count - use iterSubnets")
+  let count = 1'u64 shl delta
+  if count > maxBlocks.BiggestUInt:
+    raise cidrErr("split produces " & $count & " subnets, above the " &
+      $maxBlocks & " block cap - pass a larger maxBlocks or use iterSubnets")
+  result = @[]
+  for sub in c.iterSubnets(newPrefixLen):
+    result.add(sub)
