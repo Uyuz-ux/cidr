@@ -1,0 +1,5 @@
+# Build artifacts
+nimcache/
+*.exe
+tests/tcidr
+examples/private_net

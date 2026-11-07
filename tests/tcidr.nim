@@ -33,6 +33,14 @@ suite "parseCidr":
     expect CidrError: discard parseCidr("::1/129")
     expect CidrError: discard parseCidr("1.2.3.4/")
 
+suite "equality":
+  test "field-wise equality and != (doc examples prove bare `import cidr` suffices)":
+    check(parseCidr("10.1.2.3/8") == parseCidr("10.0.0.0/8"))
+    check(parseCidr("10.0.0.0/8") != parseCidr("10.0.0.0/16"))
+    check(parseCidr("192.168.1.0/24") != parseCidr("192.168.2.0/24"))
+    check(parseCidr("10.0.0.0/8") != parseCidr("2001:db8::/32"))
+    check(parseCidr("2001:db8::/64") == parseCidr("2001:db8:0:0:1::/64"))
+
 suite "contains":
   test "IPv4 membership":
     let c = parseCidr("192.168.1.0/24")
@@ -92,6 +100,18 @@ suite "addresses and size":
   test "last address for /32 and /128":
     check($parseCidr("1.2.3.4/32").lastAddress == "1.2.3.4")
     check($parseCidr("2001:db8::1/128").lastAddress == "2001:db8::1")
+
+  test "last address fills whole host bytes (regression: /24 returned the network address)":
+    # 0.2.0 bug found by the commonSupernet cross-validation below:
+    # withHostBits zeroed full host bytes even for lastAddress.
+    check($parseCidr("192.168.1.0/24").lastAddress == "192.168.1.255")
+    check($parseCidr("172.16.0.0/16").lastAddress == "172.16.255.255")
+    check($parseCidr("10.0.0.0/8").lastAddress == "10.255.255.255")
+    check($parseCidr("0.0.0.0/0").lastAddress == "255.255.255.255")
+    check($parseCidr("2001:db8::/64").lastAddress == "2001:db8::ffff:ffff:ffff:ffff")
+    check($parseCidr("::/0").lastAddress == "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+    # host-bit normalization must be unaffected by the same code path
+    check($parseCidr("10.1.2.3/8").normalized == "10.0.0.0/8")
 
   test "size":
     check(parseCidr("10.0.0.0/8").size == 16777216'u)
@@ -190,3 +210,104 @@ suite "subnets":
     expect CidrError:
       discard parseCidr("10.0.0.0/16").subnets(24, maxBlocks = 128)
     check(parseCidr("10.0.0.0/16").subnets(24, maxBlocks = 300).len == 256)
+
+suite "supernet":
+  test "basics":
+    check($parseCidr("192.168.1.130/26").supernet(24) == "192.168.1.0/24")
+    check($parseCidr("192.168.1.130/26").supernet(16) == "192.168.0.0/16")
+    check($parseCidr("192.168.1.130/26").supernet(0) == "0.0.0.0/0")
+    check($parseCidr("2001:db8:1::/48").supernet(32) == "2001:db8::/32")
+    check($parseCidr("2001:db8:1::/48").supernet(0) == "::/0")
+
+  test "identity at own prefix (host bits cleared)":
+    check(parseCidr("10.1.2.3/24").supernet(24) == parseCidr("10.1.2.0/24"))
+    check(parseCidr("2001:db8::1/128").supernet(128) == parseCidr("2001:db8::1/128"))
+
+  test "every subnet maps back to its parent":
+    let parent = parseCidr("172.16.0.0/16")
+    for sub in parent.subnets(19):
+      check(sub.supernet(16) == parent)
+
+  test "invalid prefix raises":
+    expect CidrError:
+      discard parseCidr("10.0.0.0/16").supernet(24)  # longer prefix is subnets' job
+    expect CidrError:
+      discard parseCidr("10.0.0.0/16").supernet(-1)
+    expect CidrError:
+      discard parseCidr("10.0.0.0/16").supernet(33)
+    expect CidrError:
+      discard parseCidr("2001:db8::/32").supernet(129)
+
+suite "commonSupernet":
+  test "basics":
+    check($commonSupernet(parseCidr("192.168.1.0/24"),
+                          parseCidr("192.168.2.0/24")) == "192.168.0.0/22")
+    check($commonSupernet(parseCidr("10.0.0.0/24"),
+                          parseCidr("10.0.1.0/24")) == "10.0.0.0/23")
+    check($commonSupernet(parseCidr("10.0.0.0/9"),
+                          parseCidr("10.128.0.0/9")) == "10.0.0.0/8")
+
+  test "nested blocks yield the outer block":
+    let outer = parseCidr("10.0.0.0/8")
+    check(commonSupernet(outer, parseCidr("10.64.0.0/10")) == outer)
+    check(commonSupernet(parseCidr("10.64.0.0/10"), outer) == outer)
+    check(commonSupernet(outer, parseCidr("10.128.0.0/24")) == outer)
+
+  test "equal blocks yield the block itself":
+    let c = parseCidr("2001:db8:1::/48")
+    check(commonSupernet(c, c) == c)
+    check(commonSupernet(parseCidr("1.2.3.4/32"), parseCidr("1.2.3.4/32")) ==
+      parseCidr("1.2.3.4/32"))
+
+  test "far apart IPv4 blocks collapse to 0.0.0.0/0":
+    check($commonSupernet(parseCidr("1.0.0.0/24"),
+                          parseCidr("255.255.255.0/24")) == "0.0.0.0/0")
+
+  test "IPv6 cases":
+    check($commonSupernet(parseCidr("2001:db8:1::/48"),
+                          parseCidr("2001:db8::/48")) == "2001:db8::/47")
+    check($commonSupernet(parseCidr("2001:db8:1::/48"),
+                          parseCidr("2001:db8:2::/48")) == "2001:db8::/46")
+    check($commonSupernet(parseCidr("2001:db8:1::/48"),
+                          parseCidr("2001:db8:8000::/33")) == "2001:db8::/32")
+
+  test "family mismatch raises":
+    expect CidrError:
+      discard commonSupernet(parseCidr("10.0.0.0/8"), parseCidr("2001:db8::/32"))
+
+  test "cross-validated against brute-force reference (random pairs)":
+    # Deterministic xorshift pool of random IPv4 blocks. The LCP-based
+    # result must equal the reference (longest prefix at which both
+    # networks truncate to the same parent), contain both blocks and
+    # be symmetric.
+    var s: uint64 = 0x9E3779B97F4A7C15'u64
+    proc next(): uint64 =
+      s = s xor (s shl 13)
+      s = s xor (s shr 7)
+      s = s xor (s shl 17)
+      s
+
+    proc randBlock(): Cidr =
+      let prefix = int(next() mod 33)
+      let raw = uint32(next() and 0xFFFFFFFF'u64)
+      let ip = IpAddress(family: IPv4, address_v4: [
+        uint8(raw shr 24 and 0xFF), uint8(raw shr 16 and 0xFF),
+        uint8(raw shr 8 and 0xFF), uint8(raw and 0xFF)])
+      parseCidr($ip & "/" & $prefix)
+
+    proc refCommon(a, b: Cidr): Cidr =
+      var p = min(a.prefixLen, b.prefixLen)
+      while parseCidr($a.address & "/" & $p) !=
+            parseCidr($b.address & "/" & $p):
+        dec p  # terminates: at /0 both truncate to 0.0.0.0/0
+      parseCidr($a.address & "/" & $p)
+
+    for i in 1 .. 5000:
+      let a = randBlock()
+      let b = randBlock()
+      let got = commonSupernet(a, b)
+      let exp = refCommon(a, b)
+      check(got == exp)
+      check(got.contains(a))
+      check(got.contains(b))
+      check(commonSupernet(b, a) == got)

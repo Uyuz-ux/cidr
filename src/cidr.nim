@@ -8,8 +8,9 @@
 ##
 ## Builds on `std/net`'s `IpAddress` and adds everything needed to work
 ## with networks in CIDR notation (`10.0.0.0/8`, `2001:db8::/32`):
-## parsing, containment, overlap checks, network/last addresses and
-## netmask conversion. Zero dependencies beyond the standard library.
+## parsing, containment, overlap checks, network/last addresses,
+## netmask conversion, subnet enumeration and supernet/merge
+## operations. Zero dependencies beyond the standard library.
 ##
 ##   import cidr
 ##
@@ -19,6 +20,8 @@
 ##   echo net.lastAddress                               # 192.168.1.255
 ##   echo parseCidr("10.1.2.3/8").normalized            # 10.0.0.0/8
 ##   echo toPrefixLen(parseIpAddress("255.255.255.0"))  # 24
+##   echo commonSupernet(parseCidr("192.168.1.0/24"),
+##                       parseCidr("192.168.2.0/24"))   # 192.168.0.0/22
 
 import std/[net, strutils]
 
@@ -57,8 +60,9 @@ func withHostBits(address: IpAddress, prefixLen: int, hostBitValue: uint8): IpAd
     var start = fullBytes
     if remBits > 0:
       inc start
+    let tailFill = if hostBitValue != 0: 0xFF'u8 else: 0'u8
     for i in start ..< bytes.len:
-      bytes[i] = 0
+      bytes[i] = tailFill
     if remBits > 0:
       let keepMask = uint8(0xFF'u8 shl (8 - remBits))
       let hostFill = if hostBitValue != 0: uint8(not keepMask) else: 0'u8
@@ -145,6 +149,17 @@ func `$`*(c: Cidr): string =
   ## Canonical string form: `address/prefixLen`.
   $c.address & "/" & $c.prefixLen
 
+func `==`*(a, b: Cidr): bool {.inline.} =
+  ## Two blocks are equal when address, prefix length and address family
+  ## all match. Defined here so equality works with a bare `import cidr`
+  ## (without pulling in `std/net`, whose `IpAddress` equality would
+  ## otherwise be out of scope). Both operands are expected to be
+  ## normalized - `parseCidr` results always are.
+  runnableExamples:
+    assert parseCidr("10.1.2.3/8") == parseCidr("10.0.0.0/8")
+    assert parseCidr("10.0.0.0/8") != parseCidr("10.0.0.0/16")
+  a.address == b.address and a.prefixLen == b.prefixLen
+
 func contains*(c: Cidr, ip: IpAddress): bool =
   ## True when `ip` falls inside the network `c`. An IPv4 block never
   ## contains an IPv6 address and vice versa.
@@ -171,7 +186,7 @@ func overlaps*(a, b: Cidr): bool =
   # address (blocks are power-of-two aligned ranges).
   a.contains(b.networkAddress) or b.contains(a.networkAddress)
 
-func size*(c: Cidr): BiggestUInt {.raises: [CidrError].} =
+func size*(c: Cidr): BiggestUInt =
   ## Number of addresses in the block. Blocks with 2^64 or more
   ## addresses (IPv6 /64 and shorter prefixes) saturate at
   ## `BiggestUInt.high`, since no integer type can hold 2^128.
@@ -273,3 +288,69 @@ func subnets*(c: Cidr, newPrefixLen: int, maxBlocks = 4096): seq[Cidr] {.raises:
   result = @[]
   for sub in c.iterSubnets(newPrefixLen):
     result.add(sub)
+
+func supernet*(c: Cidr, newPrefixLen: int): Cidr {.raises: [CidrError].} =
+  ## Parent block of `c` at `newPrefixLen` - the inverse of
+  ## `iterSubnets`/`subnets`: every subnet of the result at
+  ## `c.prefixLen` contains `c`. `newPrefixLen` must be shorter than or
+  ## equal to the block's own prefix; anything else raises `CidrError`.
+  runnableExamples:
+    assert parseCidr("192.168.1.130/26").supernet(24) == parseCidr("192.168.1.0/24")
+    assert parseCidr("2001:db8:1::/48").supernet(32) == parseCidr("2001:db8::/32")
+    assert parseCidr("10.0.0.0/8").supernet(8) == parseCidr("10.0.0.0/8")
+
+  let maxBits = case c.address.family
+    of IPv4: 32
+    of IPv6: 128
+  if newPrefixLen < 0 or newPrefixLen > maxBits:
+    raise cidrErr("prefix length out of range for IPv" &
+      (if c.address.family == IPv4: "4" else: "6") & ": " & $newPrefixLen)
+  if newPrefixLen > c.prefixLen:
+    raise cidrErr("new prefix length (" & $newPrefixLen &
+      ") is longer than the block itself (" & $c.prefixLen &
+      ") - a supernet must be equal or shorter")
+  Cidr(address: withHostBits(c.address, newPrefixLen, 0), prefixLen: newPrefixLen)
+
+func cmpAddr(x, y: IpAddress): int {.inline.} =
+  ## Lexicographic byte comparison of two same-family addresses
+  ## (-1, 0 or 1). Behavior is unspecified when families differ.
+  case x.family
+  of IPv4:
+    for i in 0 ..< 4:
+      if x.address_v4[i] != y.address_v4[i]:
+        return if x.address_v4[i] < y.address_v4[i]: -1 else: 1
+  of IPv6:
+    for i in 0 ..< 16:
+      if x.address_v6[i] != y.address_v6[i]:
+        return if x.address_v6[i] < y.address_v6[i]: -1 else: 1
+  0
+
+func commonSupernet*(a, b: Cidr): Cidr {.raises: [CidrError].} =
+  ## Smallest single CIDR block that contains both `a` and `b` (the
+  ## "merge" of two blocks). Raises `CidrError` when the blocks belong
+  ## to different address families.
+  runnableExamples:
+    assert commonSupernet(parseCidr("192.168.1.0/24"),
+                          parseCidr("192.168.2.0/24")) == parseCidr("192.168.0.0/22")
+    assert commonSupernet(parseCidr("10.0.0.0/9"),
+                          parseCidr("10.128.0.0/9")) == parseCidr("10.0.0.0/8")
+
+  if a.address.family != b.address.family:
+    raise cidrErr("cannot merge IPv4 and IPv6 blocks")
+  let a = a.normalized
+  let b = b.normalized
+  let aLast = a.lastAddress
+  let bLast = b.lastAddress
+  # The union range is [lo, hi]; the smallest CIDR containing a
+  # contiguous range has a prefix as long as the common bit prefix of
+  # its endpoints.
+  var lo, hi: IpAddress
+  lo = if cmpAddr(a.address, b.address) <= 0: a.address else: b.address
+  hi = if cmpAddr(aLast, bLast) >= 0: aLast else: bLast
+  let totalBits = case a.address.family
+    of IPv4: 32
+    of IPv6: 128
+  var l = 0
+  while l < totalBits and lo.bitAt(l) == hi.bitAt(l):
+    inc l
+  Cidr(address: withHostBits(lo, l, 0), prefixLen: l)
