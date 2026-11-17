@@ -23,7 +23,7 @@
 ##   echo commonSupernet(parseCidr("192.168.1.0/24"),
 ##                       parseCidr("192.168.2.0/24"))   # 192.168.0.0/22
 
-import std/[net, strutils]
+import std/[algorithm, net, strutils]
 
 type
   Cidr* = object
@@ -354,3 +354,58 @@ func commonSupernet*(a, b: Cidr): Cidr {.raises: [CidrError].} =
   while l < totalBits and lo.bitAt(l) == hi.bitAt(l):
     inc l
   Cidr(address: withHostBits(lo, l, 0), prefixLen: l)
+
+func cmpCidr(x, y: Cidr): int =
+  ## Total order over blocks: IPv4 before IPv6, then by network
+  ## address, then by prefix length (shorter prefixes first, so outer
+  ## blocks are visited before the subnets nested inside them).
+  if x.address.family != y.address.family:
+    return if x.address.family == IPv4: -1 else: 1
+  result = cmpAddr(x.address, y.address)
+  if result == 0:
+    result = cmp(x.prefixLen, y.prefixLen)
+
+func aggregate*(cidrs: openArray[Cidr]): seq[Cidr] =
+  ## Sorted minimal cover of a list of blocks: the shortest list of
+  ## non-overlapping blocks that covers exactly the same addresses.
+  ## Nested blocks are dropped and adjacent equal-size siblings are
+  ## merged (also across merges, so two results whose union is a
+  ## single block never coexist). Coverage is never widened - the
+  ## output covers the input and nothing else; the two halves of a
+  ## parent block merge, but a block that only partially fills its
+  ## parent stays separate. Useful to consolidate allow lists, route
+  ## summaries or firewall rules into their most compact form. IPv4
+  ## and IPv6 blocks are aggregated independently; IPv4 blocks sort
+  ## before IPv6.
+  runnableExamples:
+    assert aggregate([parseCidr("10.0.0.0/24"),
+                      parseCidr("10.0.1.0/24")]) == @[parseCidr("10.0.0.0/23")]
+    assert aggregate([parseCidr("10.0.0.0/24"),
+                      parseCidr("10.0.0.0/16")]) == @[parseCidr("10.0.0.0/16")]
+    assert aggregate([parseCidr("10.0.0.0/24"),
+                      parseCidr("10.0.2.0/24")]) == @[parseCidr("10.0.0.0/24"),
+                                                      parseCidr("10.0.2.0/24")]
+  if cidrs.len == 0:
+    return
+  var blocks = newSeq[Cidr](cidrs.len)
+  for i in 0 ..< cidrs.len:
+    blocks[i] = cidrs[i].normalized
+  blocks.sort(cmpCidr)
+  result = @[blocks[0]]
+  for i in 1 ..< blocks.len:
+    let cur = result[^1]
+    let nxt = blocks[i]
+    if cur.address.family != nxt.address.family:
+      result.add(nxt)
+      continue
+    if cur.contains(nxt):
+      continue
+    if cur.prefixLen == nxt.prefixLen:
+      # Equal-size siblings merge exactly when they are the two halves
+      # of one parent: their common supernet is that parent. Gapped
+      # siblings share a coarser ancestor and correctly stay separate.
+      let parent = commonSupernet(cur, nxt)
+      if parent.prefixLen == cur.prefixLen - 1:
+        result[^1] = parent
+        continue
+    result.add(nxt)

@@ -311,3 +311,110 @@ suite "commonSupernet":
       check(got.contains(a))
       check(got.contains(b))
       check(commonSupernet(b, a) == got)
+
+suite "aggregate":
+  test "empty input yields empty output":
+    check(aggregate(@[]).len == 0)
+
+  test "single block returns itself":
+    let n = parseCidr("192.168.1.0/24")
+    check(aggregate(@[n]) == @[n])
+
+  test "host bits normalized before aggregation":
+    check(aggregate(@[parseCidr("10.0.1.99/24")]) == @[parseCidr("10.0.1.0/24")])
+
+  test "duplicates collapse to one block":
+    check(aggregate(@[parseCidr("10.0.0.0/24"), parseCidr("10.0.0.0/24")]) ==
+          @[parseCidr("10.0.0.0/24")])
+
+  test "nested block is dropped (both input orders)":
+    let outer = parseCidr("10.0.0.0/16")
+    let inner = parseCidr("10.0.5.0/24")
+    check(aggregate(@[outer, inner]) == @[outer])
+    check(aggregate(@[inner, outer]) == @[outer])
+
+  test "nested IPv6 block is dropped":
+    check(aggregate(@[parseCidr("2001:db8::/64"),
+                      parseCidr("2001:db8::/65")]) == @[parseCidr("2001:db8::/64")])
+    check(aggregate(@[parseCidr("2001:db8::/48"),
+                      parseCidr("2001:db8:0:1::/64")]) == @[parseCidr("2001:db8::/48")])
+
+  test "adjacent equal-size siblings merge":
+    check(aggregate(@[parseCidr("10.0.0.0/24"), parseCidr("10.0.1.0/24")]) ==
+          @[parseCidr("10.0.0.0/23")])
+
+  test "gapped equal-size siblings stay separate":
+    check(aggregate(@[parseCidr("10.0.0.0/24"), parseCidr("10.0.2.0/24")]) ==
+          @[parseCidr("10.0.0.0/24"), parseCidr("10.0.2.0/24")])
+
+  test "four consecutive /24s yield two /23s, never a /22 (no added coverage)":
+    check(aggregate(@[parseCidr("10.0.0.0/24"), parseCidr("10.0.1.0/24"),
+                      parseCidr("10.0.2.0/24"), parseCidr("10.0.3.0/24")]) ==
+          @[parseCidr("10.0.0.0/23"), parseCidr("10.0.2.0/23")])
+
+  test "full siblings at coarser size merge across earlier merges":
+    # two /24s merge into a /23, which then merges with a following /23
+    check(aggregate(@[parseCidr("10.0.0.0/24"), parseCidr("10.0.1.0/24"),
+                      parseCidr("10.0.2.0/23")]) == @[parseCidr("10.0.0.0/22")])
+
+  test "neighbour filling half the gap stays separate":
+    # 10.0.2.0/24 is adjacent to 10.0.0.0/23 but the union is not a
+    # single block (10.0.3.0/24 is missing), so nothing merges
+    check(aggregate(@[parseCidr("10.0.0.0/23"), parseCidr("10.0.2.0/24")]) ==
+          @[parseCidr("10.0.0.0/23"), parseCidr("10.0.2.0/24")])
+
+  test "unsorted input is sorted":
+    check(aggregate(@[parseCidr("10.0.2.0/24"), parseCidr("10.0.0.0/24"),
+                      parseCidr("10.0.1.0/24")]) == @[parseCidr("10.0.0.0/23"),
+                                                      parseCidr("10.0.2.0/24")])
+
+  test "mixed families never merge, IPv4 sorts before IPv6":
+    let v4 = parseCidr("10.0.0.0/8")
+    let v6 = parseCidr("2001:db8::/32")
+    check(aggregate(@[v6, v4]) == @[v4, v6])
+
+  test "IPv6 adjacent siblings merge":
+    check(aggregate(@[parseCidr("2001:db8::/65"),
+                      parseCidr("2001:db8:0:0:8000::/65")]) == @[parseCidr("2001:db8::/64")])
+
+  test "cross-validated against coverage reference (random blocks)":
+    # Deterministic xorshift pool. For every output block, first and
+    # last address must be covered by the input union; for every input
+    # block, first and last address must be covered by the output
+    # union. Together with sortedness this pins the exact-cover
+    # contract without enumerating addresses.
+    var s: uint64 = 0xBF58476D1CE4E5B9'u64
+    proc next(): uint64 =
+      s = s xor (s shl 13)
+      s = s xor (s shr 7)
+      s = s xor (s shl 17)
+      s
+
+    proc randBlock(): Cidr =
+      let prefix = int(next() mod 29) + 4  # /4../32 keeps blocks small
+      let raw = uint32(next() and 0xFFFFFFFF'u64)
+      let ip = IpAddress(family: IPv4, address_v4: [
+        uint8(raw shr 24 and 0xFF), uint8(raw shr 16 and 0xFF),
+        uint8(raw shr 8 and 0xFF), uint8(raw and 0xFF)])
+      parseCidr($ip & "/" & $prefix)
+
+    proc coveredBy(ip: IpAddress, blocks: seq[Cidr]): bool =
+      result = false
+      for b in blocks:
+        if b.contains(ip):
+          return true
+
+    for i in 1 .. 3000:
+      var inputBlocks: seq[Cidr] = @[]
+      let n = int(next() mod 5) + 1
+      for j in 1 .. n:
+        inputBlocks.add(randBlock())
+      let outputBlocks = aggregate(inputBlocks)
+      for j in 1 ..< outputBlocks.len:
+        check(not outputBlocks[j - 1].overlaps(outputBlocks[j]))
+      for b in inputBlocks:
+        check(coveredBy(b.networkAddress, outputBlocks))
+        check(coveredBy(b.lastAddress, outputBlocks))
+      for b in outputBlocks:
+        check(coveredBy(b.networkAddress, inputBlocks))
+        check(coveredBy(b.lastAddress, inputBlocks))

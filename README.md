@@ -28,6 +28,7 @@ echo toPrefixLen(parseIpAddress("255.255.255.0"))   # 24
 - **Block size** (`/24` → 256 addresses), saturating for huge IPv6 blocks
 - **Subnet enumeration**: split a block into subnets (`iterSubnets` is lazy — safe for huge IPv6 ranges; `subnets` is eager with a safety cap)
 - **Supernet / merge**: walk up to a parent block (`supernet`), or compute the smallest single block containing two blocks (`commonSupernet`)
+- **List consolidation** (`aggregate`): collapse a list of blocks into its minimal exact cover — nested blocks are dropped, adjacent siblings are merged, and coverage is never widened
 - Self-contained **equality**: `parseCidr(a) == parseCidr(b)` works with a bare `import cidr`
 - Zero dependencies, pure standard library, `CidrError` (a `ValueError`) on bad input
 
@@ -40,7 +41,7 @@ nimble install cidr
 or add to your `.nimble`:
 
 ```
-requires "cidr >= 0.3.0"
+requires "cidr >= 0.4.0"
 ```
 
 ## API quick reference
@@ -59,6 +60,7 @@ requires "cidr >= 0.3.0"
 | `c.subnets(newPrefixLen, maxBlocks = 4096): seq[Cidr]` | Eager version with a safety cap; raises when the split exceeds it |
 | `c.supernet(newPrefixLen): Cidr` | Parent block at a shorter prefix — the inverse of `subnets` |
 | `commonSupernet(a, b: Cidr): Cidr` | Smallest single block containing both (the merge of two blocks) |
+| `aggregate(blocks: openArray[Cidr]): seq[Cidr]` | Sorted minimal exact cover of a block list — route summarization for allow lists and firewall rules |
 
 ## Example: splitting a block into subnets
 
